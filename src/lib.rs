@@ -3,7 +3,13 @@ mod backup;
 mod errors;
 pub mod input;
 
-use std::{mem, sync::Once};
+use std::{
+    mem,
+    sync::{
+        Mutex, MutexGuard, Once,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use arboard::{Clipboard, ImageData};
 use backup::BackupState;
@@ -23,6 +29,7 @@ use windows::{
             Dxgi::{Common::DXGI_FORMAT, DXGI_PRESENT, IDXGISwapChain, IDXGISwapChain_Vtbl},
             Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
         },
+        System::Threading::GetCurrentThreadId,
         UI::{
             Input::Pointer::EnableMouseInPointer,
             Shell::GetScaleFactorForMonitor,
@@ -33,6 +40,35 @@ use windows::{
 };
 
 static mut OVERLAY_HANDLER: Option<OverlayHandler<Box<dyn Overlay>>> = None;
+
+// Present/ResizeBuffers run on the game's render thread while the WndProc hook runs on the
+// window thread, and both mutate OVERLAY_HANDLER (e.g. the input event queue). Every hook
+// holds this lock while touching OVERLAY_HANDLER, and releases it before calling back into
+// the game, since the game's WndProc may block on its render thread and vice versa.
+static HANDLER_LOCK: Mutex<()> = Mutex::new(());
+static HANDLER_LOCK_OWNER: AtomicU32 = AtomicU32::new(0);
+
+struct HandlerGuard(Option<MutexGuard<'static, ()>>);
+
+impl Drop for HandlerGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            HANDLER_LOCK_OWNER.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Re-entrant per thread: a hook re-entered on the thread that already holds the lock
+/// (e.g. Present synchronously dispatching a window message) proceeds without locking.
+fn lock_handler() -> HandlerGuard {
+    let thread_id = unsafe { GetCurrentThreadId() };
+    if HANDLER_LOCK_OWNER.load(Ordering::Acquire) == thread_id {
+        return HandlerGuard(None);
+    }
+    let guard = HANDLER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    HANDLER_LOCK_OWNER.store(thread_id, Ordering::Release);
+    HandlerGuard(Some(guard))
+}
 
 static_detour! {
     pub static Present_Detour: unsafe extern "stdcall" fn(*const IDXGISwapChain_Vtbl, u32, DXGI_PRESENT) -> HRESULT;
@@ -219,7 +255,9 @@ impl<T: Overlay + ?Sized> OverlayHandler<T> {
         });
     }
 
-    pub fn present(&mut self) {
+    /// Returns the platform output, to be handled after releasing the handler lock:
+    /// clipboard writes can send messages to the game window's thread.
+    pub fn present(&mut self) -> PlatformOutput {
         if let Some(inner) = &mut self.inner {
             if let Some(render_target) = &inner.render_target {
                 let pixels_per_point = unsafe {
@@ -304,7 +342,6 @@ impl<T: Overlay + ?Sized> OverlayHandler<T> {
 
                 let (renderer_output, platform_output, _) =
                     egui_directx11::split_output(egui_output);
-                Self::handle_platform_output(&self.egui_ctx, platform_output);
 
                 let _ = inner.egui_renderer.render(
                     &inner.device_context,
@@ -315,6 +352,7 @@ impl<T: Overlay + ?Sized> OverlayHandler<T> {
                 );
 
                 self.backup.restore(&inner.device_context);
+                platform_output
             } else {
                 log::error!("OverylayHander::present unreachable");
                 unreachable!()
@@ -326,7 +364,7 @@ impl<T: Overlay + ?Sized> OverlayHandler<T> {
     }
 
     // Only supporting WindowsOS
-    fn handle_platform_output(ctx: &egui::Context, platform_output: PlatformOutput) {
+    fn handle_platform_output(platform_output: PlatformOutput) {
         let mut clipboard = match Clipboard::new() {
             Ok(cb) => Some(cb),
             Err(e) => {
@@ -418,13 +456,21 @@ impl<T: Overlay + ?Sized> OverlayHandler<T> {
         sync_interval: u32,
         flags: DXGI_PRESENT,
     ) -> HRESULT {
-        let overlay_handler = &raw mut OVERLAY_HANDLER;
-        if let Some(overlay_handler) = unsafe { &mut *overlay_handler } {
-            overlay_handler.lazy_initialize(unsafe { mem::transmute(&swap_chain_vtbl) });
-            overlay_handler.present()
-        } else {
-            let error = "`OverlayHandler::present_hook` Error: OVERLAY_HANDLER was not initialized";
-            log::error!("{}", error);
+        let platform_output = {
+            let _guard = lock_handler();
+            let overlay_handler = &raw mut OVERLAY_HANDLER;
+            if let Some(overlay_handler) = unsafe { &mut *overlay_handler } {
+                overlay_handler.lazy_initialize(unsafe { mem::transmute(&swap_chain_vtbl) });
+                Some(overlay_handler.present())
+            } else {
+                let error =
+                    "`OverlayHandler::present_hook` Error: OVERLAY_HANDLER was not initialized";
+                log::error!("{}", error);
+                None
+            }
+        };
+        if let Some(platform_output) = platform_output {
+            Self::handle_platform_output(platform_output);
         }
         unsafe { Present_Detour.call(swap_chain_vtbl, sync_interval, flags) }
     }
@@ -439,17 +485,24 @@ impl<T: Overlay + ?Sized> OverlayHandler<T> {
         swap_chain_flags: u32,
     ) -> HRESULT {
         let overlay_handler = &raw mut OVERLAY_HANDLER;
+        {
+            let _guard = lock_handler();
+            match unsafe { &mut *overlay_handler }.as_mut().and_then(|h| h.inner.as_mut()) {
+                Some(inner) => inner.render_target = None,
+                None => return HRESULT(0),
+            }
+        }
+        let result = Resize_Buffers_Detour.call(
+            swap_chain_vtbl,
+            buffer_count,
+            width,
+            height,
+            new_format,
+            swap_chain_flags,
+        );
+        let _guard = lock_handler();
         if let Some(overlay_handler) = unsafe { &mut *overlay_handler } {
             if let Some(inner) = &mut overlay_handler.inner.as_mut() {
-                inner.render_target = None;
-                let result = Resize_Buffers_Detour.call(
-                    swap_chain_vtbl,
-                    buffer_count,
-                    width,
-                    height,
-                    new_format,
-                    swap_chain_flags,
-                );
                 overlay_handler.overlay.resize_buffers(
                     swap_chain_vtbl,
                     buffer_count,
@@ -467,84 +520,79 @@ impl<T: Overlay + ?Sized> OverlayHandler<T> {
                 };
 
                 inner.render_target = Some(render_target);
-                return result;
             }
         }
-        HRESULT(0)
+        result
     }
 
     // Hooked function
     fn window_process_hook(hwnd: HWND, umsg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        let overlay_handler = &raw mut OVERLAY_HANDLER;
+        // Decide under the lock which message (if any) to forward, then call the game's
+        // WndProc after releasing it.
+        let (window_process_callback, umsg, wparam, lparam) = 'decide: {
+            let _guard = lock_handler();
+            let overlay_handler = &raw mut OVERLAY_HANDLER;
+            let Some(overlay_handler) = (unsafe { &mut *overlay_handler }) else {
+                return LRESULT(0);
+            };
+            let Some(inner) = &mut overlay_handler.inner else {
+                return LRESULT(0);
+            };
+            let callback = inner.window_process_callback;
+            let input = inner.input_handler.process(umsg, wparam.0, lparam.0);
 
-        if let Some(overlay_handler) = unsafe { &mut *overlay_handler } {
-            if let Some(inner) = &mut overlay_handler.inner {
-                let input = inner.input_handler.process(umsg, wparam.0, lparam.0);
-
-                if umsg == WM_CLOSE {
-                    overlay_handler
-                        .egui_ctx
-                        .memory_mut(|writer| overlay_handler.overlay.save(writer));
-                    return unsafe { (inner.window_process_callback)(hwnd, umsg, wparam, lparam) };
-                }
-
-                if let Some(options) = overlay_handler
-                    .overlay
-                    .window_process(&input, &inner.input_handler.events)
-                {
-                    // If user doesn't want to steal the input
-                    if options.should_input_pass_through {
-                        return unsafe {
-                            (inner.window_process_callback)(hwnd, umsg, wparam, lparam)
-                        };
-                    }
-
-                    // Let overlay capture input only if in focus
-                    match input {
-                        InputResult::MouseMove
-                        | InputResult::MouseLeft
-                        | InputResult::MouseRight
-                        | InputResult::MouseMiddle
-                        | InputResult::Zoom
-                        | InputResult::Scroll => {
-                            if options.should_capture_all_input
-                                || (overlay_handler.egui_ctx.wants_pointer_input()
-                                || overlay_handler.egui_ctx.is_pointer_over_area())
-                            {
-                                return LRESULT(1);
-                            }
-                        }
-                        InputResult::Character | InputResult::Key => {
-                            if options.should_capture_all_input
-                                && overlay_handler.egui_ctx.wants_keyboard_input()
-                            {
-                                return LRESULT(1);
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    if let Some(wnd_msg) = options.window_message {
-                        if options.should_process_original_message {
-                            return unsafe {
-                                (inner.window_process_callback)(hwnd, umsg, wparam, lparam)
-                            };
-                        } else {
-                            return unsafe {
-                                (inner.window_process_callback)(
-                                    hwnd,
-                                    wnd_msg.msg,
-                                    wnd_msg.wparam,
-                                    wnd_msg.lparam,
-                                )
-                            };
-                        }
-                    }
-                }
-                return unsafe { (inner.window_process_callback)(hwnd, umsg, wparam, lparam) };
+            if umsg == WM_CLOSE {
+                overlay_handler
+                    .egui_ctx
+                    .memory_mut(|writer| overlay_handler.overlay.save(writer));
+                break 'decide (callback, umsg, wparam, lparam);
             }
-        }
-        LRESULT(0)
+
+            if let Some(options) = overlay_handler
+                .overlay
+                .window_process(&input, &inner.input_handler.events)
+            {
+                // If user doesn't want to steal the input
+                if options.should_input_pass_through {
+                    break 'decide (callback, umsg, wparam, lparam);
+                }
+
+                // Let overlay capture input only if in focus
+                match input {
+                    InputResult::MouseMove
+                    | InputResult::MouseLeft
+                    | InputResult::MouseRight
+                    | InputResult::MouseMiddle
+                    | InputResult::Zoom
+                    | InputResult::Scroll => {
+                        if options.should_capture_all_input
+                            || (overlay_handler.egui_ctx.wants_pointer_input()
+                                || overlay_handler.egui_ctx.is_pointer_over_area())
+                        {
+                            return LRESULT(1);
+                        }
+                    }
+                    InputResult::Character | InputResult::Key => {
+                        if options.should_capture_all_input
+                            && overlay_handler.egui_ctx.wants_keyboard_input()
+                        {
+                            return LRESULT(1);
+                        }
+                    }
+                    _ => {}
+                }
+
+                if let Some(wnd_msg) = options.window_message {
+                    if options.should_process_original_message {
+                        break 'decide (callback, umsg, wparam, lparam);
+                    } else {
+                        break 'decide (callback, wnd_msg.msg, wnd_msg.wparam, wnd_msg.lparam);
+                    }
+                }
+            }
+            (callback, umsg, wparam, lparam)
+        };
+        unsafe { window_process_callback(hwnd, umsg, wparam, lparam) }
     }
 }
 
